@@ -12,7 +12,9 @@ import numpy as np
 import pandas as pd
 import requests
 import seaborn as sns
-from matplotlib.ticker import MaxNLocator, FuncFormatter
+from matplotlib.ticker import MaxNLocator, FuncFormatter, PercentFormatter
+import matplotlib.ticker as mtick
+
 from PIL import Image
 import pybaseball as pyb
 import matplotlib.colors as mcolors
@@ -633,48 +635,316 @@ def velocity_kdes(df: pd.DataFrame,
     subaxes[-1].set_xlabel("Velocity (mph)", font_properties_axes)
 
 
+
 def rolling_pitch_usage(df: pd.DataFrame, ax: plt.Axes, window: int = 5) -> None:
-    df_game = (
-        df.groupby(["game_pk", "game_date", "pitch_type"])["release_speed"]
-        .count()
-        .rename("count")
-        .reset_index()
+    """
+    Rolling pitch usage by game for the filtered sample.
+
+    - df must be the already-processed pitcher Statcast (df_processing)
+    - window in games; will be clamped if there are fewer games
+    """
+    if df.empty or "game_pk" not in df.columns or "pitch_type" not in df.columns:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No games in selected range", ha="center", va="center")
+        return
+
+    # sort games chronologically and map to 1..N
+    df = df.sort_values(["game_date", "game_pk"])
+    game_ids = df["game_pk"].unique()
+    num_games = len(game_ids)
+    if num_games == 0:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No games in selected range", ha="center", va="center")
+        return
+
+    eff_window = min(window, num_games)
+    game_num_map = {g: i + 1 for i, g in enumerate(game_ids)}
+
+    # per-game pitch counts by pitch_type
+    counts = (
+        df.groupby(["game_pk", "pitch_type"])["pitch_type"]
+          .count()
+          .rename("count")
+          .reset_index()
     )
-    game_list = sorted(df["game_pk"].unique(), key=lambda g: df[df["game_pk"] == g]["game_date"].iloc[0])
-    game_to_idx = {g: i + 1 for i, g in enumerate(game_list)}
+    totals = (
+        df.groupby("game_pk")["pitch_type"]
+          .count()
+          .rename("total")
+          .reset_index()
+    )
+    merged = counts.merge(totals, on="game_pk", how="left")
+    merged["usage"] = merged["count"] / merged["total"]
+    merged["game_number"] = merged["game_pk"].map(game_num_map)
 
-    df_game["game_number"] = df_game["game_pk"].map(game_to_idx)
+    pitch_types = df["pitch_type"].value_counts().index.tolist()
+    ymax = 0.0
 
-    ax.set_title(f"{window}-Game Rolling Pitch Usage", font_properties_titles)
-    max_y = 0.0
+    for pt in pitch_types:
+        sub = merged[merged["pitch_type"] == pt]
+        if sub.empty:
+            continue
 
-    for pitch_type, sub in df_game.groupby("pitch_type"):
-        counts = sub.set_index("game_number")["count"].reindex(range(1, len(game_list) + 1), fill_value=0)
-        roll = counts.rolling(window).sum() / window
-        max_y = max(max_y, roll.max())
-        ax.plot(
-            roll.index,
-            roll.values,
-            label=pitch_type,
-            linewidth=2,
-            color=dict_colour.get(pitch_type, "#000000"),
+        # reindex over all games so rolling window handles zero-usage games
+        series = (
+            sub.set_index("game_number")["usage"]
+               .reindex(range(1, num_games + 1), fill_value=0.0)
         )
 
-    xmax = len(game_list)
-    xmin = min(window, xmax)  # avoid xmin > xmax
+        roll = series.rolling(eff_window, min_periods=1).mean()
+        if roll.max() == 0:
+            continue
 
-    if xmax <= 1:
-        ax.set_xlim(1, max(2, xmax + 1))
-    else:
-        ax.set_xlim(xmin, xmax)
+        sns.lineplot(
+            x=roll.index,
+            y=roll.values,
+            ax=ax,
+            linewidth=2,
+            color=dict_colour.get(pt, "#000000"),
+            label=pt,
+        )
+        ymax = max(ymax, float(roll.max()))
 
-#    ax.set_xlim(window, len(game_list))
-    ax.set_ylim(0, max(0.01, math.ceil(max_y * 10) / 10))
-    ax.set_xlabel("Game", font_properties_axes)
-    ax.set_ylabel("Pitch Usage", font_properties_axes)
+    if ymax == 0:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "Not enough data for rolling usage",
+                ha="center", va="center")
+        return
+
+    ax.set_xlim(1, num_games)
+    ax.set_ylim(0, ymax * 1.15)
+    ax.set_xlabel("Game", fontdict=font_properties_axes)
+    ax.set_ylabel("Pitch Usage", fontdict=font_properties_axes)
+    ax.set_title(f"{eff_window}-Game Rolling Pitch Usage",
+                 fontdict=font_properties_titles)
+
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-    ax.yaxis.set_major_formatter(mpl.ticker.PercentFormatter(xmax=1, decimals=0))
-    ax.legend(fontsize=8, ncol=3)
+    ax.yaxis.set_major_formatter(
+        FuncFormatter(lambda y, _: f"{y * 100:.0f}%")
+    )
+
+    ax.legend(fontsize=8, frameon=False)
+
+
+def build_stat_line_from_df(
+    df: pd.DataFrame,
+    pitcher_id: Optional[int] = None,
+    season: Optional[int] = None,
+    game_type: Optional[str] = None,
+) -> dict:
+    """
+    Build the header-line stats for the filtered selection.
+
+    Priority:
+      1) If (pitcher_id, season, game_type) define a clean MLB split:
+         - game_type == "R" => regular season
+         - game_type == "P" => postseason
+         Use MLB Stats API to get official values.
+      2) Otherwise, derive from the filtered Statcast df (approximate).
+
+    Returns raw values; K% etc are fractions (0.273) so the caller
+    can format with .1%% etc.
+    """
+    nan = float("nan")
+
+    def _to_float(v):
+        try:
+            if v in (None, ""):
+                return nan
+            return float(v)
+        except Exception:
+            return nan
+
+    def _pct_field(row, key):
+        """
+        MLB Stats API gives e.g. "27.3" or "27.3%".
+        Convert to fraction: 0.273
+        """
+        v = row.get(key)
+        if v in (None, ""):
+            return nan
+        if isinstance(v, str) and v.endswith("%"):
+            try:
+                return float(v[:-1]) / 100.0
+            except Exception:
+                return nan
+        try:
+            return float(v) / 100.0
+        except Exception:
+            return nan
+
+    FIP_CONST = 3.1  # simple global constant; fine for our use
+
+    # ----- 1) Official MLB split when clearly defined -----
+    if pitcher_id is not None and season is not None and game_type in {"R", "P"}:
+        try:
+            mlb_game_type = "R" if game_type == "R" else "P"
+            url = (
+                f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}/stats"
+                f"?stats=season&group=pitching&gameType={mlb_game_type}&season={season}"
+            )
+            js = requests.get(url, timeout=10).json()
+            stats_list = js.get("stats", [])
+            if stats_list and stats_list[0].get("splits"):
+                row = stats_list[0]["splits"][0]["stat"]
+
+                # IP (inningsPitched is a weird string sometimes)
+                ip_str = row.get("inningsPitched", "0.0")
+                ip_val = nan
+                try:
+                    ip_val = float(ip_str)
+                except ValueError:
+                    if "." in ip_str:
+                        whole, frac = ip_str.split(".", 1)
+                        if frac.isdigit():
+                            ip_val = float(whole) + int(frac) / 3.0
+
+                bf = _to_float(row.get("battersFaced"))
+                so = _to_float(row.get("strikeOuts"))
+                bb = _to_float(row.get("baseOnBalls"))
+                hbp = _to_float(row.get("hitBatsmen"))
+                hr = _to_float(row.get("homeRuns"))
+
+                era = _to_float(row.get("era"))
+                whip = _to_float(row.get("whip"))
+
+                # Use API percentages when present; fall back to bf-based
+                k_pct = _pct_field(row, "strikeoutPercentage")
+                bb_pct = _pct_field(row, "baseOnBallPercentage")
+                if not np.isfinite(k_pct) and bf and bf > 0:
+                    k_pct = so / bf
+                if not np.isfinite(bb_pct) and bf and bf > 0:
+                    bb_pct = bb / bf
+                kbb_pct = (
+                    k_pct - bb_pct
+                    if np.isfinite(k_pct) and np.isfinite(bb_pct)
+                    else nan
+                )
+
+                # FIP from official component stats
+                if ip_val and ip_val > 0 and np.isfinite(hr) and np.isfinite(bb) and np.isfinite(hbp) and np.isfinite(so):
+                    fip = ((13 * hr) + 3 * (bb + hbp) - 2 * so) / ip_val + FIP_CONST
+                else:
+                    fip = nan
+
+                return {
+                    "IP": ip_val,
+                    "TBF": bf if np.isfinite(bf) else 0,
+                    "WHIP": whip,
+                    "ERA": era,
+                    "FIP": fip,
+                    "K%": k_pct,
+                    "BB%": bb_pct,
+                    "K-BB%": kbb_pct,
+                }
+        except Exception:
+            # On any failure, fall back to Statcast-based calc
+            pass
+
+    # ----- 2) Fallback: derive from Statcast df -----
+    if df is None or df.empty:
+        return {
+            "IP": nan, "TBF": 0, "WHIP": nan,
+            "ERA": nan, "FIP": nan,
+            "K%": nan, "BB%": nan, "K-BB%": nan,
+        }
+
+    df_sorted = df.sort_values(
+        ["game_pk", "at_bat_number", "pitch_number"],
+        ignore_index=True,
+    )
+
+    # One row per PA (last pitch)
+    df_pa = (
+        df_sorted
+        .groupby(["game_pk", "at_bat_number"], as_index=False)
+        .tail(1)
+        .copy()
+    )
+    pa = len(df_pa)
+
+    # Outs -> IP
+    OUT_EVENTS = {
+        "strikeout": 1,
+        "strikeout_double_play": 2,
+        "strikeout_triple_play": 3,
+        "groundout": 1,
+        "grounded_into_double_play": 2,
+        "double_play": 2,
+        "triple_play": 3,
+        "field_out": 1,
+        "force_out": 1,
+        "sac_bunt": 1,
+        "sac_fly": 1,
+        "sac_fly_double_play": 2,
+        "sacrifice_bunt": 1,
+        "sacrifice_fly": 1,
+        "pickoff": 1,
+    }
+    ev_pa = df_pa["events"].fillna("")
+    outs = int(sum(OUT_EVENTS.get(e, 0) for e in ev_pa))
+    ip = outs / 3.0 if outs > 0 else nan
+
+    # Approx RA from score deltas (still an approximation)
+    runs_allowed = nan
+    needed_cols = {
+        "home_score", "away_score",
+        "post_home_score", "post_away_score",
+        "inning_topbot", "game_pk",
+    }
+    if needed_cols.issubset(df_pa.columns):
+        runs_allowed = 0.0
+        for game_id, g in df_sorted.groupby("game_pk"):
+            g_pa = df_pa[df_pa["game_pk"] == game_id]
+            if g_pa.empty:
+                continue
+
+            top_ct = (g_pa["inning_topbot"] == "Top").sum()
+            bot_ct = (g_pa["inning_topbot"] == "Bot").sum()
+            if top_ct == 0 and bot_ct == 0:
+                continue
+
+            is_home_pitcher = top_ct > bot_ct
+            if is_home_pitcher:
+                diffs = (g_pa["post_away_score"] - g_pa["away_score"]).clip(lower=0)
+            else:
+                diffs = (g_pa["post_home_score"] - g_pa["home_score"]).clip(lower=0)
+
+            runs_allowed += float(diffs.sum())
+
+    if ip and ip > 0 and np.isfinite(runs_allowed):
+        era = runs_allowed * 9.0 / ip
+    else:
+        era = nan
+
+    # Components for WHIP / FIP / K%, etc.
+    walks = ev_pa.isin(["walk", "intent_walk"]).sum()
+    hbp = ev_pa.eq("hit_by_pitch").sum()
+    strikeouts = ev_pa.str.startswith("strikeout").sum()
+    hr = ev_pa.eq("home_run").sum()
+
+    whip = (walks + hbp) / ip if ip and ip > 0 else nan
+    k_rate = strikeouts / pa if pa > 0 else nan
+    bb_rate = walks / pa if pa > 0 else nan
+    kbb_rate = k_rate - bb_rate if pa > 0 else nan
+
+    if ip and ip > 0:
+        fip = ((13 * hr) + 3 * (walks + hbp) - 2 * strikeouts) / ip + FIP_CONST
+    else:
+        fip = nan
+
+    return {
+        "IP": ip,
+        "TBF": pa,
+        "WHIP": whip,
+        "ERA": era,
+        "FIP": fip,
+        "K%": k_rate,
+        "BB%": bb_rate,
+        "K-BB%": kbb_rate,
+    }
+
+
 
 
 def break_plot(df: pd.DataFrame, ax: plt.Axes) -> None:
@@ -887,40 +1157,51 @@ def pitching_dashboard(
     df_statcast_group: pd.DataFrame,
     season_label: Optional[str] = None,
     stats: Optional[List[str]] = None,
-    title_suffix: Optional[str] = None,   # ← add this
+    title_suffix: Optional[str] = None,
 ) -> plt.Figure:
-    """
-    Generate the full pitching dashboard.
-
-    - pitcher_id: MLBAM ID for the pitcher
-    - df: pitcher-level Statcast dataframe (already filtered to desired dates/teams)
-    - df_statcast_group: league-average or comparison dataframe
-    - season_label: label for display (e.g. "2025 Regular Season", "2025 Postseason LAD")
-    - stats: Fangraphs stats to show in the top table
-    """
     if stats is None:
         stats = ["IP", "TBF", "WHIP", "ERA", "FIP", "K%", "BB%", "K-BB%"]
 
-    # --- derive season for Fangraphs lookup ---
-    season = None
-    if season_label:
-        # grab first 4-digit number that looks like a year
-        for tok in str(season_label).split():
-            if tok.isdigit() and len(tok) == 4:
-                season = int(tok)
-                break
-    if season is None:
-        if "game_date" in df.columns and not df["game_date"].empty:
-            first_date = pd.to_datetime(df["game_date"].iloc[0], errors="coerce")
-            if pd.notnull(first_date):
-                season = first_date.year
-        if season is None:
-            season = _dt.datetime.now().year
+    if df.empty:
+        raise ValueError("No Statcast data for this selection; nothing to plot.")
 
-    # --- process pitcher dataframe ---
+    # Process pitcher data for plots
     df = df_processing(df)
 
-    # --- layout ---
+    # Infer season_label if not provided
+    if not season_label:
+        if "game_date" in df.columns:
+            dmin = pd.to_datetime(df["game_date"].min(), errors="coerce")
+            dmax = pd.to_datetime(df["game_date"].max(), errors="coerce")
+            if pd.notnull(dmin) and pd.notnull(dmax):
+                if dmin.year == dmax.year:
+                    season_label = f"{dmin.year} Season ({dmin.date()} – {dmax.date()})"
+                else:
+                    season_label = f"{dmin.date()} – {dmax.date()}"
+            else:
+                season_label = "Season Summary"
+        else:
+            season_label = "Season Summary"
+
+    # Infer season number
+    season = None
+    if "game_date" in df.columns:
+        season = pd.to_datetime(df["game_date"], errors="coerce").dt.year.mode()
+        if len(season):
+            season = int(season.iloc[0])
+
+    # Infer game_type for split detection
+    game_type = None
+    if "game_type" in df.columns:
+        gtypes = set(df["game_type"].dropna().unique())
+        # Pure regular season
+        if gtypes == {"R"}:
+            game_type = "R"
+        # Pure postseason: Statcast uses F/D/L/W/etc; MLB Stats uses P for postseason
+        elif gtypes.issubset({"F", "D", "L", "W", "C"}):
+            game_type = "P"
+
+    # ---------- layout ----------
     fig = plt.figure(figsize=(20, 20))
     gs = gridspec.GridSpec(
         6, 8,
@@ -939,57 +1220,56 @@ def pitching_dashboard(
     ax_table        = fig.add_subplot(gs[4, 1:7])
     ax_footer       = fig.add_subplot(gs[5, 1:7])
 
-    # borders/header strip off
-    fig.add_subplot(gs[0, 1:7]).axis("off")   # header spacer
-    fig.add_subplot(gs[:, 0]).axis("off")     # left border
-    fig.add_subplot(gs[:, -1]).axis("off")    # right border
+    # border strips
+    fig.add_subplot(gs[0, 1:7]).axis("off")
+    fig.add_subplot(gs[:, 0]).axis("off")
+    fig.add_subplot(gs[:, -1]).axis("off")
 
-    # --- Fangraphs season summary table ---
-    df_fg = fangraphs_pitching_leaderboards(season)
-    row = df_fg[df_fg["xMLBAMID"] == pitcher_id]
+    # ---------- top summary table from filtered df ----------
+    summary = build_stat_line_from_df(
+        df,
+        pitcher_id=pitcher_id,
+        season=season,
+        game_type=game_type,
+    )
 
-    if not row.empty:
-        row = row[stats].copy()
-        formatted = []
-        for col in stats:
-            fmt = fangraphs_stats_dict[col]["format"]
-            # robust formatting in case of strings/NaNs
-            def _fmt(v):
-                try:
-                    return format(float(v), fmt)
-                except Exception:
-                    return "---"
-            formatted.append([_fmt(v) for v in row[col]])
+    row_vals = []
+    col_labels = []
 
-        # transpose because we built per-col lists
-        table = ax_season_table.table(
-            cellText=list(zip(*formatted)),
-            colLabels=[fangraphs_stats_dict[c]["table_header"] for c in stats],
-            cellLoc="center",
-            bbox=[0, 0, 1, 1],
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(14)
-        ax_season_table.axis("off")
-    else:
-        ax_season_table.text(0.5, 0.5, "No Fangraphs row found", ha="center")
-        ax_season_table.axis("off")
+    for key in stats:
+        col_labels.append(fangraphs_stats_dict[key]["table_header"])
+        val = summary.get(key, float("nan"))
+        fmt = fangraphs_stats_dict[key]["format"]
+        try:
+            disp = format(val, fmt) if np.isfinite(val) else "---"
+        except Exception:
+            disp = "---"
+        row_vals.append(disp)
 
-    # --- Bio strip (uses your helpers) ---
+    table = ax_season_table.table(
+        cellText=[row_vals],
+        colLabels=col_labels,
+        cellLoc="center",
+        bbox=[0, 0, 1, 1],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(14)
+    ax_season_table.axis("off")
+
+    # ---------- bio strip ----------
     player_headshot(pitcher_id, ax_headshot)
-    # assuming your updated player_bio accepts (pitcher_id, season_label, ax)
     player_bio(pitcher_id, season_label, ax_bio)
     plot_logo(pitcher_id, ax_logo)
 
-    # --- Plots ---
+    # ---------- plots ----------
     velocity_kdes(df, ax_plot_1, gs, [3, 4], [1, 3], fig, df_statcast_group)
     rolling_pitch_usage(df, ax_plot_2, window=5)
     break_plot(df, ax_plot_3)
 
-    # --- Pitch table (per-pitch metrics vs league) ---
+    # ---------- pitch table ----------
     pitch_table(df, df_statcast_group, ax_table, fontsize=10)
 
-    # --- Footer ---
+    # ---------- footer ----------
     ax_footer.axis("off")
     ax_footer.text(
         0, 1,
@@ -1003,7 +1283,7 @@ def pitching_dashboard(
     )
     ax_footer.text(
         1, 1,
-        "Data: MLB Statcast, FanGraphs  |  Images: MLB, ESPN",
+        "Data: MLB Statcast, FanGraphs (for league)  |  Images: MLB, ESPN",
         ha="right", va="top", fontsize=9,
     )
 
