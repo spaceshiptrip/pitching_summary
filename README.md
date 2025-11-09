@@ -1,122 +1,167 @@
-# ⚾ Pitching Summary CLI (Enhanced TJStats Edition)
+# Pitching Summary Graphic (CLI-Enabled Fork)
 
-This project builds on the original "TJStats" Pitching Summary by adding a **Command-Line Interface (CLI)** for generating custom pitching dashboards for any MLB pitcher, any season — directly from Statcast data.  
+This project generates TJStats-style pitching summary dashboards using MLB Statcast, FanGraphs, and related data.
 
-The CLI version supports automatic Statcast retrieval, caching, and saves output as high-quality summary graphics.
+This fork adds:
 
----
+- A **command-line interface (`ps_cli.py`)** to generate dashboards for any pitcher.
+- Flexible **date filters** (by season or explicit start/end dates).
+- **Postseason-only** or **regular-season-only** views.
+- Optional **team-based filters** (e.g. only games vs/with LAD).
+- Dynamic **league-average comparison** table (with caching).
+- Basic **pytest**-based tests for core helpers.
 
-## 🧠 Overview
-
-Originally developed by [Thomas Nestico](https://github.com/tnestico/pitching_summary), this framework visualizes advanced pitch metrics such as movement, velocity, whiff rate, xwOBA, chase rate, and league comparison.
-
-The new CLI extension allows analysts, fans, and developers to:
-- Generate summaries without Jupyter or manual notebook editing
-- Quickly compare pitchers across seasons
-- Cache league-wide stat averages for faster re-use
-- Run headless, making it suitable for automation or TUI integration
+The goal is to make it easy to analyze pitchers throughout the season (or in specific slices) without touching the notebook.
 
 ---
 
-## 🚀 Example CLI Usage
+## Example Output
 
-```bash
-# Activate your virtual environment
-source .venv/bin/activate
-
-# Run the CLI to analyze a pitcher
-python ps_cli.py "Shohei Ohtani" --season 2025 --out ohtani_2025.png
-```
-
-**Output:**  
-- A `.png` dashboard summarizing pitch usage, whiff/chase rates, and run-value impact  
-- Cached Statcast and league data for faster subsequent runs
-
----
-
-## 🧩 Example Output
+Example layout (from the original project, style preserved in this fork):
 
 ![alt text](images/output.png)
 
 ---
 
-## 📰 Article
+## CLI Usage
 
-Refer to both the [.IPYNB file](https://github.com/tnestico/pitching_summary/blob/main/pitcher_summary.ipynb) and the accompanying  
-[Medium Article](https://medium.com/@thomasjamesnestico/creating-the-perfect-pitching-summary-7b8a981ef0c5)  
-for methodology and visualization breakdown.
+From the repo root (inside your virtual environment):
+
+```bash
+python ps_cli.py --help
+```
+
+Output:
+
+```text
+usage: ps_cli.py [-h] [--season SEASON] [--start-date START_DATE] [--end-date END_DATE]
+                 [--postseason] [--regular] [--team-filter TEAM_FILTER]
+                 [--out OUT_PATH] [--league-cache LEAGUE_CACHE] [--verbose]
+                 pitcher
+
+Generate TJStats-style pitching summary dashboards from Statcast.
+
+positional arguments:
+  pitcher               Pitcher name, e.g. "Tarik Skubal" or "Shohei Ohtani"
+
+options:
+  -h, --help            show this help message and exit
+  --season SEASON       Season year (e.g. 2024). Used for defaults & postseason windows.
+  --start-date START_DATE
+                        Start date (YYYY-MM-DD). Overrides --season default.
+  --end-date END_DATE   End date (YYYY-MM-DD). Overrides --season default.
+  --postseason          Use only postseason games for the given season.
+  --regular             Use only regular-season games for the given season.
+  --team-filter TEAM_FILTER
+                        Optional: limit to games where this team (MLB abbrev) is either
+                        the pitcher's team or the opponent. Example: --team-filter LAD
+  --out OUT_PATH, -o OUT_PATH
+                        Output PNG file. If omitted, shows the figure interactively.
+  --league-cache LEAGUE_CACHE
+                        CSV path to cache league-wide grouped metrics.
+  --verbose, -v         Verbose logging.
+```
+
+### Common Examples
+
+Generate a full-season dashboard:
+
+```bash
+python ps_cli.py "Yoshinobu Yamamoto" --season 2025 --out images/yamamoto2025.png
+```
+
+Postseason-only for a pitcher:
+
+```bash
+python ps_cli.py "Shohei Ohtani" --season 2025 --postseason --out images/ohtani_2025_post.png
+```
+
+Filter to games involving a specific team (either on his team or opponent):
+
+```bash
+python ps_cli.py "Blake Snell" --season 2025 --postseason --team-filter LAD   --out images/snell_lad_post2025.png
+```
+
+Custom date window:
+
+```bash
+python ps_cli.py "Tarik Skubal" --start-date 2025-04-01 --end-date 2025-06-30   --out images/skubal_apr_jun_2025.png
+```
+
+If `--out` is omitted, the figure will be displayed instead of written to disk.
+
+League-wide comparison metrics are automatically loaded from `statcast_2024_grouped.csv`
+when appropriate, or dynamically built & cached via `--league-cache` for other windows.
 
 ---
 
-## ⚙️ Requirements
+## Article / Original Notebook
 
-#### Python Versions
-✅ Works with **Python 3.9** or **3.10**  
-⚠️ *Not compatible with Python 3.11+ due to `matplotlib` and `pybaseball` dependency issues.*
+For methodology details and the original implementation, see:
 
-#### Required Packages
+- Original notebook: `pitcher_summary.ipynb`
+- Original article (by @tnestico): Medium – *Creating the Perfect Pitching Summary*
+
+This fork keeps the original layout/visual identity while exposing a scriptable interface.
+
+---
+
+## Requirements
+
+### Python Version
+
+You **must** use:
+
+- **Python 3.9** or **Python 3.10**
+
+Python **3.11+ is not supported** at this time due to upstream dependency compatibility (notably `pybaseball` and plotting stack versions).
+
+### Recommended Versions / Packages
+
+Install via:
+
+```bash
+pip install -r requirements.txt
 ```
+
+The environment should include (or be compatible with):
+
+```text
 pandas==1.5.2
 numpy==1.23.5
 seaborn==0.11.1
 pybaseball==2.2.7
 matplotlib==3.5.1
-PIL.Image==10.3.0
+Pillow==10.3.0
 requests==2.31.0
+pytest>=8.0.0   # for running tests (optional)
 ```
 
-To install dependencies:
+---
+
+## Running Tests
+
+From the repo root:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+pytest -v
 ```
 
----
+This runs basic sanity checks on:
 
-## 🧰 CLI Options
-
-| Option | Description |
-|--------|--------------|
-| `--season` | Year to fetch Statcast data (e.g., `--season 2024`) |
-| `--out` | Output filename for the image (e.g., `--out skubal_2024.png`) |
-| `--league-cache` | (Optional) Path to cached league averages CSV |
-| `--help` | Show available arguments |
-
-Example:
-```bash
-python ps_cli.py "Tarik Skubal" --season 2024 --out skubal_2024.png
-```
+- Statcast dataframe processing helpers.
+- ERA math and summary line construction.
+- A smoke test that `pitching_dashboard` runs end-to-end on fake data.
 
 ---
 
-## ⚾ Methodology Highlights
+## Contributing
 
-Each summary includes:
-- **Pitch usage %**
-- **Velocity & spin rate**
-- **Movement (pfx_z / pfx_x)**
-- **Whiff / chase / in-zone rates**
-- **xwOBA and delta run expectancy**
-- **Comparison to league-average baselines**
+Feel free to:
 
----
+- Open issues or PRs against this fork.
+- Open a PR from this fork back to the original `tnestico/pitching_summary` repo
+  if you’d like these CLI and filtering features to be upstreamed.
 
-## 🧱 Caching
-
-Statcast requests can be **slow** — enable caching to save partial progress and speed up future runs:
-
-```python
-from pybaseball import cache
-cache.enable()
-```
-
-This will cache data locally in `~/.pybaseball/`.
-
----
-
-## 🧾 License
-
-MIT © 2025 — Forked and CLI-enhanced by [spaceshiptrip](https://github.com/spaceshiptrip)  
-Original concept and notebook by [Thomas Nestico](https://github.com/tnestico)
+Layout credit: **@TJStats**  
+CLI wrapper, filters & tests: **@spaceshiptrip**
