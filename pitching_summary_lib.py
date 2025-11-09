@@ -17,6 +17,11 @@ from PIL import Image
 import pybaseball as pyb
 import matplotlib.colors as mcolors
 
+import os
+from datetime import datetime
+import datetime as _dt
+
+
 
 
 
@@ -116,7 +121,66 @@ table_columns = [
     "xwoba",
 ]
 
+
+
+
 # ---------- Core data helpers ----------
+
+
+def get_pitcher_id_for_name(name: str) -> Optional[int]:
+    """
+    Resolve a pitcher name like 'Blake Snell' to an MLBAM pitcher id using pybaseball.
+    Returns None if we can't find a match.
+    """
+    name = name.strip()
+    if not name:
+        return None
+
+    # Try "First Last"
+    parts = name.split()
+    if len(parts) >= 2:
+        first = " ".join(parts[:-1])
+        last = parts[-1]
+    else:
+        # Single token: let fuzzy handle it
+        first = ""
+        last = parts[0]
+
+    try:
+        df = pyb.playerid_lookup(last, first)
+    except Exception:
+        df = pd.DataFrame()
+
+    if not df.empty:
+        # prefer pitcher w/ most recent MLB season
+        df = df.sort_values("mlb_played_last", ascending=False)
+        return int(df.iloc[0]["key_mlbam"])
+
+    # Fallback: fuzzy lookup
+    try:
+        fuzzy = pyb.playerid_lookup(last, first, fuzzy=True)
+    except Exception:
+        fuzzy = pd.DataFrame()
+
+    if not fuzzy.empty:
+        fuzzy = fuzzy.sort_values("mlb_played_last", ascending=False)
+        return int(fuzzy.iloc[0]["key_mlbam"])
+
+    return None
+
+
+def fetch_pitcher_statcast(pitcher_id: int, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Wrapper around pybaseball.statcast_pitcher with a clean interface.
+    """
+    df = pyb.statcast_pitcher(start_date, end_date, pitcher_id)
+    if df is None:
+        return pd.DataFrame()
+
+    # Normalize column names if needed
+    # (pybaseball already returns what we expect for this project)
+    return df
+
 
 def df_processing(df_pyb: pd.DataFrame) -> pd.DataFrame:
     df = df_pyb.copy()
@@ -301,6 +365,152 @@ def load_or_build_league_grouped(
 
     return league
 
+
+def _add_derived_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """Add swing/whiff/zone/chase and convert pfx_x/z to inches for movement."""
+    df = df.copy()
+
+    swing_code = [
+        "foul_bunt",
+        "foul",
+        "hit_into_play",
+        "swinging_strike",
+        "foul_tip",
+        "swinging_strike_blocked",
+        "missed_bunt",
+        "bunt_foul_tip",
+    ]
+    whiff_code = [
+        "swinging_strike",
+        "foul_tip",
+        "swinging_strike_blocked",
+    ]
+
+    df["swing"] = df["description"].isin(swing_code)
+    df["whiff"] = df["description"].isin(whiff_code)
+    df["in_zone"] = df["zone"] < 10
+    df["out_zone"] = df["zone"] > 10
+    df["chase"] = (~df["in_zone"]) & (df["swing"])
+
+    # movement in inches
+    if "pfx_z" in df.columns:
+        df["pfx_z"] = df["pfx_z"] * 12
+    if "pfx_x" in df.columns:
+        df["pfx_x"] = df["pfx_x"] * 12
+
+    return df
+
+
+def _group_league_by_pitch(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate league-wide Statcast into the columns used for comparison / coloring.
+    Output structure is compatible with pitch_table's expectations.
+    """
+    needed = [
+        "pitch_type",
+        "release_speed",
+        "pfx_z",
+        "pfx_x",
+        "release_spin_rate",
+        "release_pos_x",
+        "release_pos_z",
+        "release_extension",
+        "delta_run_exp",
+        "swing",
+        "whiff",
+        "in_zone",
+        "out_zone",
+        "chase",
+        "estimated_woba_using_speedangle",
+    ]
+    df = df[[c for c in needed if c in df.columns]].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=["pitch_type"])
+
+    g = (
+        df.groupby("pitch_type")
+        .agg(
+            pitch=("pitch_type", "count"),
+            release_speed=("release_speed", "mean"),
+            pfx_z=("pfx_z", "mean"),
+            pfx_x=("pfx_x", "mean"),
+            release_spin_rate=("release_spin_rate", "mean"),
+            release_pos_x=("release_pos_x", "mean"),
+            release_pos_z=("release_pos_z", "mean"),
+            release_extension=("release_extension", "mean"),
+            delta_run_exp=("delta_run_exp", "sum"),
+            swing=("swing", "sum"),
+            whiff=("whiff", "sum"),
+            in_zone=("in_zone", "sum"),
+            out_zone=("out_zone", "sum"),
+            chase=("chase", "sum"),
+            xwoba=("estimated_woba_using_speedangle", "mean"),
+        )
+        .reset_index()
+    )
+
+    # derived rates
+    total_pitches = g["pitch"].sum()
+    g["pitch_usage"] = g["pitch"] / total_pitches
+
+    g["whiff_rate"] = g["whiff"] / g["swing"].replace(0, np.nan)
+    g["in_zone_rate"] = g["in_zone"] / g["pitch"].replace(0, np.nan)
+    g["chase_rate"] = g["chase"] / g["out_zone"].replace(0, np.nan)
+    g["delta_run_exp_per_100"] = -g["delta_run_exp"] / g["pitch"].replace(0, np.nan) * 100
+
+    return g
+
+
+def load_or_build_league_grouped(
+    start_date: str,
+    end_date: str,
+    cache_path: str = "statcast_grouped_cache.csv",
+    postseason_only: bool = False,
+    regular_only: bool = False,
+) -> pd.DataFrame:
+    """
+    Used by ps_cli.py to get league-average by pitch type for the same window.
+    - If cache_path exists, use it.
+    - Else, pull Statcast for the window, aggregate, and cache.
+    """
+    # If a cached table exists, trust it (user can regenerate manually if needed)
+    if os.path.exists(cache_path):
+        try:
+            df_cached = pd.read_csv(cache_path)
+            if "pitch_type" in df_cached.columns:
+                return df_cached
+        except Exception:
+            pass  # fall through to rebuild
+
+    # Build from Statcast
+    df_all = pyb.statcast(start_date, end_date)
+    if df_all is None or df_all.empty:
+        # Fall back to empty; calling code should handle gracefully
+        return pd.DataFrame(columns=["pitch_type"])
+
+    # Optional postseason/regular filters
+    if "game_type" in df_all.columns:
+        if postseason_only:
+            df_all = df_all[df_all["game_type"].isin(["F", "D", "L", "W"])]
+        elif regular_only:
+            df_all = df_all[df_all["game_type"] == "R"]
+
+    if df_all.empty:
+        return pd.DataFrame(columns=["pitch_type"])
+
+    df_all = _add_derived_flags(df_all)
+    g = _group_league_by_pitch(df_all)
+
+    # cache for next time
+    try:
+        g.to_csv(cache_path, index=False)
+    except Exception:
+        pass
+
+    return g
+
+
 # ---------- Bio & images ----------
 
 def player_headshot(pitcher_id: int, ax: plt.Axes) -> None:
@@ -450,7 +660,15 @@ def rolling_pitch_usage(df: pd.DataFrame, ax: plt.Axes, window: int = 5) -> None
             color=dict_colour.get(pitch_type, "#000000"),
         )
 
-    ax.set_xlim(window, len(game_list))
+    xmax = len(game_list)
+    xmin = min(window, xmax)  # avoid xmin > xmax
+
+    if xmax <= 1:
+        ax.set_xlim(1, max(2, xmax + 1))
+    else:
+        ax.set_xlim(xmin, xmax)
+
+#    ax.set_xlim(window, len(game_list))
     ax.set_ylim(0, max(0.01, math.ceil(max_y * 10) / 10))
     ax.set_xlabel("Game", font_properties_axes)
     ax.set_ylabel("Pitch Usage", font_properties_axes)
@@ -665,16 +883,44 @@ def pitch_table(df: pd.DataFrame,
 
 def pitching_dashboard(
     pitcher_id: int,
-    df_pyb: pd.DataFrame,
+    df: pd.DataFrame,
     df_statcast_group: pd.DataFrame,
-    season_label: str,
+    season_label: Optional[str] = None,
     stats: Optional[List[str]] = None,
+    title_suffix: Optional[str] = None,   # ← add this
 ) -> plt.Figure:
+    """
+    Generate the full pitching dashboard.
+
+    - pitcher_id: MLBAM ID for the pitcher
+    - df: pitcher-level Statcast dataframe (already filtered to desired dates/teams)
+    - df_statcast_group: league-average or comparison dataframe
+    - season_label: label for display (e.g. "2025 Regular Season", "2025 Postseason LAD")
+    - stats: Fangraphs stats to show in the top table
+    """
     if stats is None:
-        stats = ["IP","TBF","WHIP","ERA","FIP","K%","BB%","K-BB%"]
+        stats = ["IP", "TBF", "WHIP", "ERA", "FIP", "K%", "BB%", "K-BB%"]
 
-    df = df_processing(df_pyb)
+    # --- derive season for Fangraphs lookup ---
+    season = None
+    if season_label:
+        # grab first 4-digit number that looks like a year
+        for tok in str(season_label).split():
+            if tok.isdigit() and len(tok) == 4:
+                season = int(tok)
+                break
+    if season is None:
+        if "game_date" in df.columns and not df["game_date"].empty:
+            first_date = pd.to_datetime(df["game_date"].iloc[0], errors="coerce")
+            if pd.notnull(first_date):
+                season = first_date.year
+        if season is None:
+            season = _dt.datetime.now().year
 
+    # --- process pitcher dataframe ---
+    df = df_processing(df)
+
+    # --- layout ---
     fig = plt.figure(figsize=(20, 20))
     gs = gridspec.GridSpec(
         6, 8,
@@ -683,30 +929,41 @@ def pitching_dashboard(
         figure=fig,
     )
 
-    ax_headshot = fig.add_subplot(gs[1, 1:3])
-    ax_bio = fig.add_subplot(gs[1, 3:5])
-    ax_logo = fig.add_subplot(gs[1, 5:7])
+    ax_headshot     = fig.add_subplot(gs[1, 1:3])
+    ax_bio          = fig.add_subplot(gs[1, 3:5])
+    ax_logo         = fig.add_subplot(gs[1, 5:7])
     ax_season_table = fig.add_subplot(gs[2, 1:7])
-    ax_plot_1 = fig.add_subplot(gs[3, 1:3])
-    ax_plot_2 = fig.add_subplot(gs[3, 3:5])
-    ax_plot_3 = fig.add_subplot(gs[3, 5:7])
-    ax_table = fig.add_subplot(gs[4, 1:7])
-    ax_footer = fig.add_subplot(gs[5, 1:7])
+    ax_plot_1       = fig.add_subplot(gs[3, 1:3])
+    ax_plot_2       = fig.add_subplot(gs[3, 3:5])
+    ax_plot_3       = fig.add_subplot(gs[3, 5:7])
+    ax_table        = fig.add_subplot(gs[4, 1:7])
+    ax_footer       = fig.add_subplot(gs[5, 1:7])
 
-    # Empty borders
-    for spec in [gs[0,1:7], gs[:,0], gs[:,-1]]:
-        fig.add_subplot(spec).axis("off")
+    # borders/header strip off
+    fig.add_subplot(gs[0, 1:7]).axis("off")   # header spacer
+    fig.add_subplot(gs[:, 0]).axis("off")     # left border
+    fig.add_subplot(gs[:, -1]).axis("off")    # right border
 
-    # Season table (Fangraphs)
-    df_fg = fangraphs_pitching_leaderboards(int(season_label[:4]))
+    # --- Fangraphs season summary table ---
+    df_fg = fangraphs_pitching_leaderboards(season)
     row = df_fg[df_fg["xMLBAMID"] == pitcher_id]
+
     if not row.empty:
         row = row[stats].copy()
+        formatted = []
         for col in stats:
             fmt = fangraphs_stats_dict[col]["format"]
-            row[col] = row[col].astype(float).map(lambda v: format(v, fmt))
+            # robust formatting in case of strings/NaNs
+            def _fmt(v):
+                try:
+                    return format(float(v), fmt)
+                except Exception:
+                    return "---"
+            formatted.append([_fmt(v) for v in row[col]])
+
+        # transpose because we built per-col lists
         table = ax_season_table.table(
-            cellText=row.values,
+            cellText=list(zip(*formatted)),
             colLabels=[fangraphs_stats_dict[c]["table_header"] for c in stats],
             cellLoc="center",
             bbox=[0, 0, 1, 1],
@@ -718,27 +975,37 @@ def pitching_dashboard(
         ax_season_table.text(0.5, 0.5, "No Fangraphs row found", ha="center")
         ax_season_table.axis("off")
 
-    # Top bio strip
+    # --- Bio strip (uses your helpers) ---
     player_headshot(pitcher_id, ax_headshot)
+    # assuming your updated player_bio accepts (pitcher_id, season_label, ax)
     player_bio(pitcher_id, season_label, ax_bio)
     plot_logo(pitcher_id, ax_logo)
 
-    # Plots
-    velocity_kdes(df, ax_plot_1, gs, [3,4], [1,3], fig, df_statcast_group)
+    # --- Plots ---
+    velocity_kdes(df, ax_plot_1, gs, [3, 4], [1, 3], fig, df_statcast_group)
     rolling_pitch_usage(df, ax_plot_2, window=5)
     break_plot(df, ax_plot_3)
 
-    # Pitch table
+    # --- Pitch table (per-pitch metrics vs league) ---
     pitch_table(df, df_statcast_group, ax_table, fontsize=10)
 
-    # Footer
+    # --- Footer ---
     ax_footer.axis("off")
-    ax_footer.text(0, 1, "By: @TJStats (layout)  |  CLI wrapper by you 😎",
-                   ha="left", va="top", fontsize=10)
-    ax_footer.text(0.5, 1, "Colour Coding vs League Average (per pitch type)",
-                   ha="center", va="top", fontsize=9)
-    ax_footer.text(1, 1, "Data: MLB, Statcast, Fangraphs  |  Images: MLB, ESPN",
-                   ha="right", va="top", fontsize=9)
+    ax_footer.text(
+        0, 1,
+        "By: @TJStats (layout)  |  CLI wrapper & filters by @spaceshiptrip",
+        ha="left", va="top", fontsize=10,
+    )
+    ax_footer.text(
+        0.5, 1,
+        "Colour coding vs league averages by pitch type",
+        ha="center", va="top", fontsize=9,
+    )
+    ax_footer.text(
+        1, 1,
+        "Data: MLB Statcast, FanGraphs  |  Images: MLB, ESPN",
+        ha="right", va="top", fontsize=9,
+    )
 
     plt.tight_layout()
     return fig
